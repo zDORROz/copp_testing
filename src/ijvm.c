@@ -1,8 +1,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
+#include <string.h> // For memset
 #include "ijvm.h"
 #include "util.h"
+
+
+// Forward declarations for GC
+void run_gc(ijvm* m);
+void mark_recursive(ijvm* m, word_t potential_ref);
+heap_object_t* find_heap_object(ijvm* m, word_t ref);
 
 // --- Stack Utilities ---
 Stack* create_stack(int capacity) {
@@ -36,7 +43,6 @@ word_t pop(Stack* s) {
 
 // --- Method Invocation Logic ---
 void invoke_method(ijvm* m, uint16_t method_index) {
-    // Use the struct member for the check
     if (method_index >= (m->constant_pool_size / 4)) { m->halted = true; return; }
     uint32_t method_address = get_constant(m, method_index);
     if (method_address + 3 >= m->text_size) { m->halted = true; return; }
@@ -100,7 +106,6 @@ ijvm* init_ijvm(char *binary_path, FILE* input , FILE* output)
     byte_t constants_size_buf[4];
     if(fread(constants_size_buf, 4, 1, binary) != 1) { fclose(binary); free(m); return NULL; }
     
-    // Store the constant pool size in the struct
     m->constant_pool_size = read_uint32(constants_size_buf);
 
     if ((ftell(binary) + m->constant_pool_size) > (unsigned long)file_size) { fclose(binary); free(m); return NULL; }
@@ -139,6 +144,18 @@ ijvm* init_ijvm(char *binary_path, FILE* input , FILE* output)
     m->program_counter = 0;
     m->lv_pointer = 0;
     for (int i = 0; i < 1024; ++i) push(m->stack, 0);
+    
+    // Initialize heap
+    m->heap_capacity = 16;
+    m->heap_size = 0;
+    m->heap = malloc(m->heap_capacity * sizeof(heap_object_t*));
+    m->next_ref = 100; // Start refs from a non-trivial number
+
+    // Initialize GC test members
+    m->freed_refs_capacity = 16;
+    m->freed_refs_size = 0;
+    m->freed_refs = malloc(m->freed_refs_capacity * sizeof(word_t));
+
 
     return m;
 }
@@ -153,10 +170,63 @@ void step(ijvm* m)
         case OP_LDC_W: {
             if (m->program_counter + 1 >= m->text_size) { m->halted = true; break; }
             uint16_t const_index = read_uint16(&m->text[m->program_counter]);
-            // Use the stored size for the check
             if (const_index >= (m->constant_pool_size / 4)) { m->halted = true; break; }
             m->program_counter += 2;
             push(m->stack, get_constant(m, const_index));
+            break;
+        }
+        case OP_NEWARRAY: {
+            if (m->stack->top < 0) { m->halted = true; break; }
+            word_t count = pop(m->stack);
+            if (count < 0) { m->halted = true; break; }
+
+            // Clear freed refs list for tests
+            m->freed_refs_size = 0;
+
+            if (m->heap_size >= m->heap_capacity) {
+                m->heap_capacity *= 2;
+                m->heap = realloc(m->heap, m->heap_capacity * sizeof(heap_object_t*));
+            }
+            heap_object_t* new_obj = malloc(sizeof(heap_object_t));
+            new_obj->size = count;
+            new_obj->data = (word_t*)malloc(count * sizeof(word_t));
+            memset(new_obj->data, 0, count * sizeof(word_t)); // Initialize to zero
+            new_obj->reference = m->next_ref++;
+            new_obj->marked = false;
+            
+            m->heap[m->heap_size++] = new_obj;
+            push(m->stack, new_obj->reference);
+            break;
+        }
+        case OP_IALOAD: {
+            if (m->stack->top < 1) { m->halted = true; break; }
+            word_t arrayref = pop(m->stack);
+            word_t index = pop(m->stack);
+            heap_object_t* obj = find_heap_object(m, arrayref);
+            if (obj == NULL || index < 0 || index >= obj->size) {
+                fprintf(m->out, "ERROR: Array index out of bounds.\n");
+                m->halted = true;
+                break;
+            }
+            push(m->stack, obj->data[index]);
+            break;
+        }
+        case OP_IASTORE: {
+            if (m->stack->top < 2) { m->halted = true; break; }
+            word_t arrayref = pop(m->stack);
+            word_t index = pop(m->stack);
+            word_t value = pop(m->stack);
+            heap_object_t* obj = find_heap_object(m, arrayref);
+            if (obj == NULL || index < 0 || index >= obj->size) {
+                fprintf(m->out, "ERROR: Array index out of bounds.\n");
+                m->halted = true;
+                break;
+            }
+            obj->data[index] = value;
+            break;
+        }
+        case OP_GC: {
+            run_gc(m);
             break;
         }
         case OP_BIPUSH:
@@ -234,6 +304,49 @@ void step(ijvm* m)
             invoke_method(m, method_index);
             break;
         }
+        case OP_TAILCALL: {
+            if (m->program_counter + 1 >= m->text_size) { m->halted = true; break; }
+            uint16_t method_index = read_uint16(&m->text[m->program_counter]);
+            m->program_counter += 2;
+
+            if (method_index >= (m->constant_pool_size / 4)) { m->halted = true; break; }
+            uint32_t method_address = get_constant(m, method_index);
+            if (method_address + 3 >= m->text_size) { m->halted = true; break; }
+
+            uint16_t num_params = read_uint16(&m->text[method_address]);
+            uint16_t num_locals = read_uint16(&m->text[method_address + 2]);
+
+            if (m->stack->top < (int)num_params - 1) { m->halted = true; break; }
+            if (m->lv_pointer == 0) { m->halted = true; break; }
+
+            word_t temp_args[num_params];
+            for (int i = 0; i < num_params; i++) {
+                temp_args[num_params - 1 - i] = pop(m->stack);
+            }
+
+            int link_ptr_target = m->stack->elements[m->lv_pointer];
+            word_t caller_ret_pc = m->stack->elements[link_ptr_target];
+            word_t caller_old_lv = m->stack->elements[link_ptr_target + 1];
+
+            m->stack->top = m->lv_pointer - 1;
+
+            for (int i = 0; i < num_params; i++) {
+                push(m->stack, temp_args[i]);
+            }
+
+            int new_lv = m->stack->top - (num_params - 1);
+            int new_link_ptr_target = new_lv + num_params + num_locals;
+
+            for (int i = 0; i < num_locals; ++i) push(m->stack, 0);
+
+            push(m->stack, caller_ret_pc);
+            push(m->stack, caller_old_lv);
+
+            m->stack->elements[new_lv] = new_link_ptr_target;
+            m->lv_pointer = new_lv;
+            m->program_counter = method_address + 4;
+            break;
+        }
         case OP_IRETURN:
             return_from_method(m);
             break;
@@ -294,9 +407,101 @@ void step(ijvm* m)
     }
 }
 
+// --- Garbage Collection ---
+void mark_recursive(ijvm* m, word_t potential_ref) {
+    heap_object_t* obj = find_heap_object(m, potential_ref);
+    if (obj != NULL && !obj->marked) {
+        obj->marked = true;
+        for (int i = 0; i < obj->size; i++) {
+            mark_recursive(m, obj->data[i]);
+        }
+    }
+}
+
+void run_gc(ijvm* m) {
+    fprintf(m->out, "Garbage collection triggered.\n");
+
+    // 1. Reset marks
+    for (int i = 0; i < m->heap_size; i++) {
+        m->heap[i]->marked = false;
+    }
+
+    // 2. Mark phase: More precise scan
+    // First, build a map of stack locations that should be skipped (link data)
+    bool* skip_map = calloc(m->stack->top + 1, sizeof(bool));
+    if (!skip_map && m->stack->top >=0) { m->halted = true; return; } // Allocation failed
+
+    int current_lv = m->lv_pointer;
+    while (current_lv != 0) {
+        int link_loc = m->stack->elements[current_lv];
+        
+        // Mark the PC and old LV locations to be skipped
+        if (link_loc <= m->stack->top) skip_map[link_loc] = true;
+        if (link_loc + 1 <= m->stack->top) skip_map[link_loc + 1] = true;
+
+        current_lv = m->stack->elements[link_loc + 1];
+    }
+    
+    // Now, scan every word on the stack, unless it's marked for skipping.
+    for (int i = 0; i <= m->stack->top; i++) {
+        if (!skip_map[i]) {
+            mark_recursive(m, m->stack->elements[i]);
+        }
+    }
+    free(skip_map);
+
+
+    // 3. Sweep phase
+    m->freed_refs_size = 0; // Clear for new cycle
+    int new_heap_size = 0;
+    for (int i = 0; i < m->heap_size; i++) {
+        if (m->heap[i]->marked) {
+            m->heap[new_heap_size++] = m->heap[i];
+        } else {
+            // Record freed reference for testing
+            if (m->freed_refs_size >= m->freed_refs_capacity) {
+                m->freed_refs_capacity *= 2;
+                m->freed_refs = realloc(m->freed_refs, m->freed_refs_capacity * sizeof(word_t));
+            }
+            m->freed_refs[m->freed_refs_size++] = m->heap[i]->reference;
+            
+            // Free the object
+            free(m->heap[i]->data);
+            free(m->heap[i]);
+        }
+    }
+    m->heap_size = new_heap_size;
+}
 
 // --- Utility and Other Functions ---
-void destroy_ijvm(ijvm* m) { if(m){destroy_stack(m->stack);free(m->text);free(m->constant_pool);free(m);} }
+void destroy_ijvm(ijvm* m) {
+    if(m) {
+        // Free all remaining heap objects
+        for (int i = 0; i < m->heap_size; i++) {
+            if (m->heap[i]) {
+                free(m->heap[i]->data);
+                free(m->heap[i]);
+            }
+        }
+        free(m->heap);
+        free(m->freed_refs);
+        destroy_stack(m->stack);
+        free(m->text);
+        free(m->constant_pool);
+        free(m);
+    }
+}
+
+heap_object_t* find_heap_object(ijvm* m, word_t ref) {
+    for (int i = 0; i < m->heap_size; i++) {
+        if (m->heap[i]->reference == ref) {
+            return m->heap[i];
+        }
+    }
+    return NULL;
+}
+
+
 byte_t *get_text(ijvm* m) { return m->text; }
 unsigned int get_text_size(ijvm* m) { return m->text_size; }
 word_t get_constant(ijvm* m, int i) { return m->constant_pool[i]; }
@@ -307,5 +512,33 @@ word_t get_local_variable(ijvm* m, int i) { return m->stack->elements[m->lv_poin
 byte_t get_instruction(ijvm* m) { return get_text(m)[get_program_counter(m)]; }
 ijvm* init_ijvm_std(char *binary_path) { return init_ijvm(binary_path, stdin, stdout); }
 void run(ijvm* m) { while (!finished(m)) step(m); }
-int get_call_stack_size(ijvm* m) { return 0; }
-bool is_heap_freed(ijvm* m, word_t reference) { return false; }
+
+int get_call_stack_size(ijvm* m) {
+    if (!m || m->stack->top < 0) {
+        return 0;
+    }
+
+    int count = 0;
+    int current_lv = m->lv_pointer;
+
+    while (current_lv != 0) {
+        count++;
+        int link_ptr_target = m->stack->elements[current_lv];
+
+        if (link_ptr_target < 0 || (unsigned int)(link_ptr_target + 1) > (unsigned int)m->stack->top) {
+            return count; // Corrupted stack or pointing outside
+        }
+        current_lv = m->stack->elements[link_ptr_target + 1];
+    }
+    
+    count++; // For the main frame
+    return count;
+}
+bool is_heap_freed(ijvm* m, word_t reference) {
+    for (int i = 0; i < m->freed_refs_size; i++) {
+        if (m->freed_refs[i] == reference) {
+            return true;
+        }
+    }
+    return false;
+}
