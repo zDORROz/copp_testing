@@ -278,10 +278,6 @@ void step(ijvm* m)
         obj->data[index] = value;
         break;
     }
-    case OP_GC: {
-        // Garbage Collection is removed
-        break;
-    }
     case OP_BIPUSH:
         if (m->program_counter >= m->text_size) { m->halted = true; break; }
         push(m->stack, (int8_t)m->text[m->program_counter++]);
